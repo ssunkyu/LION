@@ -10,5 +10,6 @@
 
 # if permission error, run 
 # newgrp  docker 
+cd "$(dirname "$0")"
 docker build -t nvcr.io/nvidian/lion_env:0 .
 
