@@ -14,5 +14,6 @@ docker="nvcr.io/nvidian/lion_env:0"
 # echo $PWD
 # exit
 code_path=$PWD
-docker run --gpus "2,3" -p 8081:8081 --ipc=host -v $code_path:$code_path -it $docker bash
-
+# docker run --gpus all -p 8081:8081 --ipc=host -v $code_path:$code_path -it $docker bash
+# docker run --gpus all --env NVIDIA_VISIBLE_DEVICES=2,3 -p 8081:8081 --ipc=host -v $code_path:$code_path -it $docker bash
+docker run --gpus '"device=2,3"' -p 8081:8081 --ipc=host -v $code_path:$code_path -it $docker bash

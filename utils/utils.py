@@ -1533,3 +1533,26 @@ def infer_active_variables(train_queue, vae, args, device, distributed, max_iter
                 kl_meter.update(kl_diag[0], 1)  # only the top scale
     average_tensor(kl_meter.avg, distributed)
     return kl_meter.avg > 0.1
+
+def find_synset_id(category_name, metadata_file):
+    """
+    Finds the 8-digit synset ID for a given category name from a metadata file.
+    
+    Args:
+        category_name (str): The common name of the category (e.g., 'chair').
+        metadata_file (str): Path to the metadata file (e.g., 'shapenet_synset_list.txt').
+                               Assumes format: "03001627 chair, armchair, ..." per line.
+    
+    Returns:
+        str: The found synset ID, or None if not found.
+    """
+    try:
+        with open(metadata_file, 'r') as f:
+            for line in f:
+                if category_name in line:
+                    # The synset ID is the first part of the line
+                    return line.split()[0]
+    except FileNotFoundError:
+        print(f"Error: Metadata file not found at {metadata_file}")
+        return None
+    return None

@@ -39,7 +39,7 @@ else:
     clip_feat = None
 output = lion.sample(1 if clip_feat is None else clip_feat.shape[0], clip_feat=clip_feat)
 pts = output['points']
-img_name = "/tmp/tmp.png"
+img_name = "./tmp/tmp.png"
 plot_points(pts, output_name=img_name)
 img = Image.open(img_name)
 img.show()
