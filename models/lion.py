@@ -15,15 +15,14 @@ import torch
 from matplotlib import pyplot as plt
 import numpy as np
 from tqdm.auto import tqdm
+import logging
 
 class LION(object):
     def __init__(self, cfg):
         # self.vae = VAE(cfg).cuda()
         self.vae = VAE(cfg)
         GlobalPrior = import_model(cfg.latent_pts.style_prior)
-        # global_prior = GlobalPrior(cfg.sde, cfg.latent_pts.style_dim, cfg).cuda()
         global_prior = GlobalPrior(cfg.sde, cfg.latent_pts.style_dim, cfg)
-        # local_prior = LocalPrior(cfg.sde, cfg.shapelatent.latent_dim, cfg).cuda()
         local_prior = LocalPrior(cfg.sde, cfg.shapelatent.latent_dim, cfg)
         self.priors = torch.nn.ModuleList([global_prior, local_prior])
         self.scheduler = DDPMScheduler(clip_sample=False,
@@ -33,17 +32,7 @@ class LION(object):
         # self.load_model(cfg)
 
     def to(self, device):
-        """
-        Moves all internal PyTorch models (VAE and Priors) to the specified device.
-
-        Args:
-            device (str or torch.device): The device to move the models to ('cuda', 'cpu', etc.).
-        
-        Returns:
-            self: The instance of the LION class.
-        """
         self.vae.to(device)
-        # self.priors is an nn.ModuleList, so calling .to() on it moves all contained modules.
         self.priors.to(device)
         print(f"LION's components (VAE, Priors) moved to {device}.")
         return self
@@ -100,81 +89,98 @@ class LION(object):
         output_dict['points'] = output
         return output_dict
     
-    def dps_sample(self, y: torch.Tensor, loss_fn, guidance_scale: float, num_samples=1,
-                   forward_model=None, clip_feat=None, save_img=False):
+    def dps_sample(self, y: torch.Tensor, loss_fn: torch.nn.Module, guidance_scale: float, num_samples=1,
+               forward_model=None, clip_feat=None, save_img=False, debug=False, guidance_start_t=900):
         """
-        DPS + Chamfer distance
-        
-        Args:
-            y (torch.Tensor): measurements.
-            guidance_scale (float): reconstruction guidance scale.
-            forward_model : measurement operator.
+        Performs guided sampling using DPS with a given loss function.
+        Guidance is applied only for t <= guidance_start_t.
         """
-        self.scheduler.set_timesteps(1000, device='cuda')
+        # 1. Setup scheduler and timesteps
+        n_timesteps = 1000 if not debug else 100
+        self.scheduler.set_timesteps(n_timesteps, device=y.device)
         timesteps = self.scheduler.timesteps
         latent_shape = self.vae.latent_shape()
         global_prior, local_prior = self.priors[0], self.priors[1]
-        assert(not local_prior.mixed_prediction and not global_prior.mixed_prediction)
         
         output_dict = {}
 
-        # start sample global prior
+        # 2. Global Prior Sampling (unconditional)
         x_T_shape_global = [num_samples] + latent_shape[0]
-        z_global = torch.randn(size=x_T_shape_global, device='cuda')
-        for i, t in enumerate(tqdm(timesteps, desc="Sampling Global Prior")):
-            t_tensor = torch.ones(num_samples, dtype=torch.int64, device='cuda') * (t + 1)
-            noise_pred_global = global_prior(x=z_global, t=t_tensor.float(), clip_feat=clip_feat)
-            z_global = self.scheduler.step(noise_pred_global, t, z_global).prev_sample
+        z_global = torch.randn(size=x_T_shape_global, device=y.device)
+        with torch.no_grad():
+            for i, t in enumerate(tqdm(timesteps, desc="Sampling Global Prior")):
+                t_tensor = torch.ones(num_samples, dtype=torch.int64, device=y.device) * (t + 1)
+                noise_pred_global = global_prior(x=z_global, t=t_tensor.float(), clip_feat=clip_feat)
+                z_global = self.scheduler.step(noise_pred_global, t, z_global).prev_sample
         output_dict['z_global'] = z_global
         
-        condition_input = z_global
-        condition_input = self.vae.global2style(condition_input)
+        condition_input = self.vae.global2style(z_global)
 
-        # start sample local prior
+        # 3. Local Prior Sampling with DPS Guidance
         x_T_shape_local = [num_samples] + latent_shape[1]
-        z_local = torch.randn(size=x_T_shape_local, device='cuda')
-        for i, t in enumerate(tqdm(timesteps, desc="Sampling Local Prior")):
-            with torch.enable_grad():
-                z_local_grad = z_local.detach().requires_grad_(True)
-                
-                t_tensor = torch.ones(num_samples, dtype=torch.int64, device='cuda') * (t + 1)
-                noise_pred_local = local_prior(x=z_local_grad, t=t_tensor.float(), 
-                                               condition_input=condition_input, clip_feat=clip_feat)
+        z_local = torch.randn(size=x_T_shape_local, device=y.device)
+        
+        for i, t in enumerate(tqdm(timesteps, desc="Sampling Local Prior (DPS)")):
+            # --- Standard denoising step (prediction) ---
+            with torch.no_grad():
+                t_tensor = torch.ones(num_samples, dtype=torch.int64, device=y.device) * (t + 1)
+                noise_pred_local = local_prior(x=z_local, t=t_tensor.float(), 
+                                            condition_input=condition_input, clip_feat=clip_feat)
+                z_local_prev = self.scheduler.step(noise_pred_local, t, z_local).prev_sample
 
-                alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                beta_prod_t = 1 - alpha_prod_t
-                z0_pred = (z_local_grad - beta_prod_t.sqrt() * noise_pred_local) / alpha_prod_t.sqrt()
+            # --- Apply guidance if current timestep t is within the desired range ---
+            if t <= guidance_start_t:
+                with torch.enable_grad():
+                    z_local_grad = z_local.detach().requires_grad_(True)
+                    
+                    # Re-predict noise on the grad-enabled tensor
+                    noise_pred_local_grad = local_prior(x=z_local_grad, t=t_tensor.float(), 
+                                                        condition_input=condition_input, clip_feat=clip_feat)
+
+                    # Predict x0 (the clean data) from the current noisy state
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    beta_prod_t = 1 - alpha_prod_t
+                    z0_pred = (z_local_grad - beta_prod_t.sqrt() * noise_pred_local_grad) / (alpha_prod_t.sqrt() + 1e-8)
+
+                    # Decode the predicted x0 to get the point cloud
+                    sampled_list = [z_global, z0_pred]
+                    x0_pred = self.vae.sample(num_samples=num_samples, decomposed_eps=sampled_list)
+                    
+                    # Get the measurement of the predicted point cloud
+                    y_pred = forward_model.forward(x0_pred) if forward_model is not None else x0_pred
+                    
+                    # Calculate the loss between the prediction and the target measurement
+                    dist1, dist2, _, _ = loss_fn(y_pred, y)
+                    loss = torch.mean(dist1) + torch.mean(dist2)
                 
-                # --- THIS IS THE FIX ---
-                # Pass latents as a list to the 'decomposed_eps' argument.
-                x0_pred = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z0_pred])
-                # ----------------------
-                
-                if forward_model is not None:
-                    y_pred = forward_model.forward(x0_pred)
-                else:
-                    y_pred = x0_pred
-                
-                dist1, dist2, _, _ = loss_fn(y_pred, y)
-                loss = torch.mean(dist1) + torch.mean(dist2)
-                
+                # Compute the gradient of the loss with respect to the noisy latent
                 grad = torch.autograd.grad(loss, z_local_grad)[0]
 
-            # score gradient step
-            z_local_prev = self.scheduler.step(noise_pred_local, t, z_local).prev_sample
+                # Update the denoised latent with the guidance gradient
+                z_local = z_local_prev - guidance_scale * grad
+            else:
+                # If not guiding, just use the standard denoised output
+                z_local = z_local_prev
             
-            # reconstruction gradient step
-            z_local = z_local_prev - guidance_scale * grad
+            if debug:
+                if i % 20 == 0 or i == len(timesteps) - 1:
+                    grad_norm = torch.linalg.norm(grad.detach()) if t <= guidance_start_t else 0
+                    z_local_norm = torch.linalg.norm(z_local.detach())
+                    logging.info(f"Debug [Step {i:04d}/{len(timesteps)}]: Grad Norm={grad_norm:.4e}, z_local Norm={z_local_norm:.4e}")
         
         output_dict['z_local'] = z_local
 
-        # Final decoding of the latent variables
-        output = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z_local])
+        # 4. Final Decoding
+        # Decode the final global and local latents into the output point cloud
+        sampled_list = [z_global, z_local]
+        with torch.no_grad():
+            output = self.vae.sample(num_samples=num_samples, decomposed_eps=sampled_list)
         
         if save_img:
             out_name = plot_points(output, "./tmp/tmp.png")
-            print(f'INFO save plot image at {out_name}')
+            print(f'INFO: Saved plot image at {out_name}')
         output_dict['points'] = output
+            
         return output_dict
 
     def get_mixing_component(self, noise_pred, t):

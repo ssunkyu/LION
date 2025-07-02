@@ -20,16 +20,16 @@ from huggingface_hub import hf_hub_download
 
 model_path = './lion_ckpt/text2shape/chair/checkpoints/model.pt'
 model_config = './lion_ckpt/text2shape/chair/cfg.yml'
+device_str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 config.merge_from_file(model_config)
 lion = LION(config)
 lion.load_model(model_path)
+lion.to(device_str)
 
 if config.clipforge.enable:
     input_t = ["a swivel chair, five wheels"] 
-    device_str = 'cuda'
-    clip_model, clip_preprocess = clip.load(
-                        config.clipforge.clip_model, device=device_str)    
+    clip_model, clip_preprocess = clip.load(config.clipforge.clip_model, device=device_str)    
     text = clip.tokenize(input_t).to(device_str)
     clip_feat = []
     clip_feat.append(clip_model.encode_text(text).float())

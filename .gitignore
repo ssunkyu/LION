@@ -14,3 +14,5 @@ data/
 datasets/test_data
 lion_ckpt.zip
 tmp/
+log/
+elders/
