@@ -6,18 +6,18 @@
 paths:
   pcd_data: './data/ShapeNetCore.v2.PC15k'
   model: './lion_ckpt/text2shape/chair/checkpoints/model.pt'
-  model_cfg: './lion_ckpt/text2shape/chair/cfg.yml'
+  model_cfg: './config/chair_cfg.yml' # './lion_ckpt/text2shape/chair/cfg.yml'
   log_dir: './log'
 
 # --- Experiment Settings ---
 experiment:
   category_to_find: 'chair'
   forward_operator: 'denoise_pcd'
-  prompt: "a comfortable leather armchair"
+  prompt: ""
 
 # --- Hyperparameters ---
 hyperparameters:
-  guidance_scale: 0.001 # 1e-3
-  guidance_start_t: 200
-  debug_mode: false
+  guidance_scale: 200 # 1e-3
+  guidance_start_t: 600
+  debug_mode: true
   model_n_points: 2048

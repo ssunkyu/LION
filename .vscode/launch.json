@@ -8,7 +8,7 @@
             "name": "LION_inv debug",
             "type": "python",
             "request": "launch",
-            "program": "demo_inverse_problem.py",
+            "program": "demo_ip.py",
             "console": "integratedTerminal",
             // "args": "${command:pickArgs}"
         }
