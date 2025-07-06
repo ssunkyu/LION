@@ -6,7 +6,7 @@
 paths:
   pcd_data: './data/ShapeNetCore.v2.PC15k'
   model: './lion_ckpt/text2shape/chair/checkpoints/model.pt'
-  model_cfg: './config/chair_cfg.yml' # './lion_ckpt/text2shape/chair/cfg.yml'
+  model_cfg: './config/chair_cfg.yml'
   log_dir: './log'
 
 # --- Experiment Settings ---
@@ -14,10 +14,18 @@ experiment:
   category_to_find: 'chair'
   forward_operator: 'denoise_pcd'
   prompt: ""
+  
+  loss_functions:
+    - name: 'chamfer'
+      weight: 1.0
+    - name: 'emd'
+      weight: 1.0
 
 # --- Hyperparameters ---
 hyperparameters:
-  guidance_scale: 200 # 1e-3
-  guidance_start_t: 600
-  debug_mode: true
+  guidance_scale: 100.0 # 0 = deactivate guidance
+  guidance_start_t: 1000
   model_n_points: 2048
+  debug_mode: true
+  guidance_scheduler: 'linear'
+  soft_chamfer_temperature: 0.1

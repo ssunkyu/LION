@@ -206,6 +206,12 @@ class Prior(nn.Module):
             if temb.shape[0] == 1 and temb.shape[0] < clip_feat.shape[0]:
                 temb = temb.expand(clip_feat.shape[0], -1, -1, -1)
             temb = torch.cat([temb, clip_feat], dim=1)  # add to temb feature
+        else:
+            # Even when clip_forge is disabled, ResBlockSEClip still expects a clip_feat.
+            # Create a dummy tensor of the same size for concatenation.
+            dummy_clip_feat = torch.zeros_like(temb)
+            temb = torch.cat([temb, dummy_clip_feat], dim=1)
+
         # mask out inactive variables
         if self.mixed_prediction and self.is_active is not None:
             x = mask_inactive_variables(x, self.is_active)
@@ -227,4 +233,3 @@ class PriorSEClip(Prior):
   building_block = ResBlockSEClip 
   def __init__(self, *args, **kwargs):
       super().__init__(*args, **kwargs)
-

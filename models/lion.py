@@ -16,6 +16,7 @@ from matplotlib import pyplot as plt
 import numpy as np
 from tqdm.auto import tqdm
 import logging
+from third_party.ChamferDistancePytorch.chamfer3D.dist_chamfer_3D import chamfer_3DDist
 
 class LION(object):
     def __init__(self, cfg):
@@ -88,99 +89,247 @@ class LION(object):
             print(f'INFO save plot image at {out_name}')
         output_dict['points'] = output
         return output_dict
-    
-    def dps_sample(self, y: torch.Tensor, loss_fn: torch.nn.Module, guidance_scale: float, num_samples=1,
-               forward_model=None, clip_feat=None, save_img=False, debug=False, guidance_start_t=900):
+
+    def dps_sample(self,
+                   y: torch.Tensor,
+                   loss_fn: torch.nn.Module,
+                   guidance_scale: float,
+                   guidance_scheduler: str,
+                   guidance_start_t: int,
+                   num_samples=1,
+                   forward_model=None,
+                   clip_feat=None,
+                   save_img=False,
+                   debug=False):
         """
-        Performs guided sampling using DPS with a given loss function.
-        Guidance is applied only for t <= guidance_start_t.
+        Performs guided sampling using Diffusion Policy Gradient (DPS).
         """
-        # 1. Setup scheduler and timesteps
-        n_timesteps = 1000 if not debug else 100
+        # 1. Setup
+        n_timesteps = 1000
         self.scheduler.set_timesteps(n_timesteps, device=y.device)
         timesteps = self.scheduler.timesteps
         latent_shape = self.vae.latent_shape()
         global_prior, local_prior = self.priors[0], self.priors[1]
-        
         output_dict = {}
 
-        # 2. Global Prior Sampling (unconditional)
+        # For debug logging
+        if debug:
+            debug_cd_loss = chamfer_3DDist()
+
+        # 2. Global Prior Sampling (Unconditional)
         x_T_shape_global = [num_samples] + latent_shape[0]
         z_global = torch.randn(size=x_T_shape_global, device=y.device)
         with torch.no_grad():
-            for i, t in enumerate(tqdm(timesteps, desc="Sampling Global Prior")):
-                t_tensor = torch.ones(num_samples, dtype=torch.int64, device=y.device) * (t + 1)
+            for t in tqdm(timesteps, desc="Sampling Global Prior"):
+                t_tensor = torch.full((num_samples,), t + 1, device=y.device, dtype=torch.long)
                 noise_pred_global = global_prior(x=z_global, t=t_tensor.float(), clip_feat=clip_feat)
                 z_global = self.scheduler.step(noise_pred_global, t, z_global).prev_sample
-        output_dict['z_global'] = z_global
         
+        output_dict['z_global'] = z_global
         condition_input = self.vae.global2style(z_global)
 
-        # 3. Local Prior Sampling with DPS Guidance
+        # 3. Local Prior Sampling with optional DPS Guidance
         x_T_shape_local = [num_samples] + latent_shape[1]
         z_local = torch.randn(size=x_T_shape_local, device=y.device)
         
-        for i, t in enumerate(tqdm(timesteps, desc="Sampling Local Prior (DPS)")):
-            # --- Standard denoising step (prediction) ---
-            with torch.no_grad():
-                t_tensor = torch.ones(num_samples, dtype=torch.int64, device=y.device) * (t + 1)
-                noise_pred_local = local_prior(x=z_local, t=t_tensor.float(), 
-                                            condition_input=condition_input, clip_feat=clip_feat)
-                z_local_prev = self.scheduler.step(noise_pred_local, t, z_local).prev_sample
+        is_guidance_active = guidance_scale > 0 and guidance_start_t > 0
+        desc = f"DPS Sampling ({guidance_scheduler} guidance)" if is_guidance_active else "Unconditional Sampling"
 
-            # --- Apply guidance if current timestep t is within the desired range ---
-            if t <= guidance_start_t:
+        for i, t in enumerate(tqdm(timesteps, desc=desc)):
+            t_tensor = torch.full((num_samples,), t + 1, device=y.device, dtype=torch.long)
+            
+            # Determine if guidance should be applied at the current timestep
+            apply_guidance_this_step = is_guidance_active and t < guidance_start_t
+
+            if apply_guidance_this_step:
+                # --- Guidance Step ---
                 with torch.enable_grad():
                     z_local_grad = z_local.detach().requires_grad_(True)
                     
-                    # Re-predict noise on the grad-enabled tensor
-                    noise_pred_local_grad = local_prior(x=z_local_grad, t=t_tensor.float(), 
-                                                        condition_input=condition_input, clip_feat=clip_feat)
-
-                    # Predict x0 (the clean data) from the current noisy state
+                    # Predict noise to estimate x0
+                    noise_pred_local = local_prior(x=z_local_grad, t=t_tensor.float(), condition_input=condition_input, clip_feat=clip_feat)
+                    
                     alpha_prod_t = self.scheduler.alphas_cumprod[t]
                     beta_prod_t = 1 - alpha_prod_t
-                    z0_pred = (z_local_grad - beta_prod_t.sqrt() * noise_pred_local_grad) / (alpha_prod_t.sqrt() + 1e-8)
-
-                    # Decode the predicted x0 to get the point cloud
-                    sampled_list = [z_global, z0_pred]
-                    x0_pred = self.vae.sample(num_samples=num_samples, decomposed_eps=sampled_list)
+                    z0_pred = (z_local_grad - beta_prod_t.sqrt() * noise_pred_local) / alpha_prod_t.sqrt()
                     
-                    # Get the measurement of the predicted point cloud
+                    # Decode estimated x0 and calculate loss
+                    x0_pred = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z0_pred])
                     y_pred = forward_model.forward(x0_pred) if forward_model is not None else x0_pred
+                    loss = loss_fn(y_pred, y)
                     
-                    # Calculate the loss between the prediction and the target measurement
-                    dist1, dist2, _, _ = loss_fn(y_pred, y)
-                    loss = torch.mean(dist1) + torch.mean(dist2)
-                
-                # Compute the gradient of the loss with respect to the noisy latent
-                grad = torch.autograd.grad(loss, z_local_grad)[0]
+                    # Get gradient of the loss w.r.t. the latent
+                    grad = torch.autograd.grad(loss, z_local_grad)[0]
 
-                # Update the denoised latent with the guidance gradient
-                z_local = z_local_prev - guidance_scale * grad
-            else:
-                # If not guiding, just use the standard denoised output
-                z_local = z_local_prev
+                with torch.no_grad():
+                    # Get the unconditional sample from the scheduler
+                    prev_sample = self.scheduler.step(noise_pred_local.detach(), t, z_local).prev_sample
+                    
+                    # Normalize gradient to use only its direction
+                    grad_normalized = grad / (torch.sqrt(loss.detach()) + 1e-8)
+                    
+                    # Calculate time-dependent guidance scale
+                    if guidance_scheduler == 'linear':
+                        guidance_scale_t = guidance_scale * (t / guidance_start_t)
+                    else: # 'constant'
+                        guidance_scale_t = guidance_scale
+                    
+                    # Apply the centered guidance
+                    z_local = prev_sample - guidance_scale_t * grad_normalized
             
-            if debug:
-                if i % 20 == 0 or i == len(timesteps) - 1:
-                    grad_norm = torch.linalg.norm(grad.detach()) if t <= guidance_start_t else 0
-                    z_local_norm = torch.linalg.norm(z_local.detach())
-                    logging.info(f"Debug [Step {i:04d}/{len(timesteps)}]: Grad Norm={grad_norm:.4e}, z_local Norm={z_local_norm:.4e}")
+            else:
+                # --- Unconditional Step ---
+                with torch.no_grad():
+                    noise_pred_local = local_prior(x=z_local, t=t_tensor.float(), condition_input=condition_input, clip_feat=clip_feat)
+                    z_local = self.scheduler.step(noise_pred_local, t, z_local).prev_sample
+            
+            # --- Debugging and Visualization ---
+            if debug and (i % 100 == 0 or i == len(timesteps) - 1):
+                with torch.no_grad():
+                    # Always predict x0 from the current z_local for logging
+                    current_noise_pred = local_prior(x=z_local, t=t_tensor.float(), condition_input=condition_input, clip_feat=clip_feat)
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    beta_prod_t = 1 - alpha_prod_t
+                    z0_pred_debug = (z_local - beta_prod_t.sqrt() * current_noise_pred) / alpha_prod_t.sqrt()
+                    x0_pred_debug = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z0_pred_debug])
+                    
+                    # [요청 3] Log reconstruction error (Chamfer Distance) instead of grad norm
+                    y_pred_debug = forward_model.forward(x0_pred_debug)
+                    dist1, dist2, _, _ = debug_cd_loss(y_pred_debug, y)
+                    cd_error = torch.mean(dist1) + torch.mean(dist2)
+
+                    logging.info(f"\nDebug [Step {i:04d}/{len(timesteps)}] - Reconstruction Error (CD): {cd_error.item():.4f}")
+                    
+                    # Save intermediate reconstruction
+                    plot_points(x0_pred_debug, f"./tmp/recon_step_{i:04d}.png")
         
         output_dict['z_local'] = z_local
 
         # 4. Final Decoding
-        # Decode the final global and local latents into the output point cloud
-        sampled_list = [z_global, z_local]
         with torch.no_grad():
-            output = self.vae.sample(num_samples=num_samples, decomposed_eps=sampled_list)
-        
-        if save_img:
-            out_name = plot_points(output, "./tmp/tmp.png")
-            print(f'INFO: Saved plot image at {out_name}')
+            output = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z_local])
         output_dict['points'] = output
+        return output_dict
+    
+    def plsd_sample(self,
+                    y: torch.Tensor,
+                    loss_fn: torch.nn.Module,
+                    guidance_scale: float,
+                    guidance_scheduler: str,
+                    guidance_start_t: int,
+                    num_samples=1,
+                    forward_model=None,
+                    clip_feat=None,
+                    save_img=False,
+                    debug=False):
+        """
+        Performs guided sampling using Diffusion Policy Gradient (PLSD).
+        """
+        # 1. Setup
+        n_timesteps = 1000
+        self.scheduler.set_timesteps(n_timesteps, device=y.device)
+        timesteps = self.scheduler.timesteps
+        latent_shape = self.vae.latent_shape()
+        global_prior, local_prior = self.priors[0], self.priors[1]
+        output_dict = {}
+
+        # For debug logging
+        if debug:
+            debug_cd_loss = chamfer_3DDist()
+
+        # 2. Global Prior Sampling (Unconditional)
+        x_T_shape_global = [num_samples] + latent_shape[0]
+        z_global = torch.randn(size=x_T_shape_global, device=y.device)
+        with torch.no_grad():
+            for t in tqdm(timesteps, desc="Sampling Global Prior"):
+                t_tensor = torch.full((num_samples,), t + 1, device=y.device, dtype=torch.long)
+                noise_pred_global = global_prior(x=z_global, t=t_tensor.float(), clip_feat=clip_feat)
+                z_global = self.scheduler.step(noise_pred_global, t, z_global).prev_sample
+        
+        output_dict['z_global'] = z_global
+        condition_input = self.vae.global2style(z_global)
+
+        # 3. Local Prior Sampling with optional DPS Guidance
+        x_T_shape_local = [num_samples] + latent_shape[1]
+        z_local = torch.randn(size=x_T_shape_local, device=y.device)
+        
+        is_guidance_active = guidance_scale > 0 and guidance_start_t > 0
+        desc = f"DPS Sampling ({guidance_scheduler} guidance)" if is_guidance_active else "Unconditional Sampling"
+
+        for i, t in enumerate(tqdm(timesteps, desc=desc)):
+            t_tensor = torch.full((num_samples,), t + 1, device=y.device, dtype=torch.long)
             
+            # Determine if guidance should be applied at the current timestep
+            apply_guidance_this_step = is_guidance_active and t < guidance_start_t
+
+            if apply_guidance_this_step:
+                # --- Guidance Step ---
+                with torch.enable_grad():
+                    z_local_grad = z_local.detach().requires_grad_(True)
+                    
+                    # Predict noise to estimate x0
+                    noise_pred_local = local_prior(x=z_local_grad, t=t_tensor.float(), condition_input=condition_input, clip_feat=clip_feat)
+                    
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    beta_prod_t = 1 - alpha_prod_t
+                    z0_pred = (z_local_grad - beta_prod_t.sqrt() * noise_pred_local) / alpha_prod_t.sqrt()
+                    
+                    # Decode estimated x0 and calculate loss
+                    x0_pred = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z0_pred])
+                    y_pred = forward_model.forward(x0_pred) if forward_model is not None else x0_pred
+                    loss = loss_fn(y_pred, y)
+                    
+                    # Get gradient of the loss w.r.t. the latent
+                    grad = torch.autograd.grad(loss, z_local_grad)[0]
+
+                with torch.no_grad():
+                    # Get the unconditional sample from the scheduler
+                    prev_sample = self.scheduler.step(noise_pred_local.detach(), t, z_local).prev_sample
+                    
+                    # Normalize gradient to use only its direction
+                    grad_normalized = grad / (torch.sqrt(loss.detach()) + 1e-8)
+                    
+                    # Calculate time-dependent guidance scale
+                    if guidance_scheduler == 'linear':
+                        guidance_scale_t = guidance_scale * (t / guidance_start_t)
+                    else: # 'constant'
+                        guidance_scale_t = guidance_scale
+                    
+                    # Apply the centered guidance
+                    z_local = prev_sample - guidance_scale_t * grad_normalized
+            
+            else:
+                # --- Unconditional Step ---
+                with torch.no_grad():
+                    noise_pred_local = local_prior(x=z_local, t=t_tensor.float(), condition_input=condition_input, clip_feat=clip_feat)
+                    z_local = self.scheduler.step(noise_pred_local, t, z_local).prev_sample
+            
+            # --- Debugging and Visualization ---
+            if debug and (i % 100 == 0 or i == len(timesteps) - 1):
+                with torch.no_grad():
+                    # Always predict x0 from the current z_local for logging
+                    current_noise_pred = local_prior(x=z_local, t=t_tensor.float(), condition_input=condition_input, clip_feat=clip_feat)
+                    alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                    beta_prod_t = 1 - alpha_prod_t
+                    z0_pred_debug = (z_local - beta_prod_t.sqrt() * current_noise_pred) / alpha_prod_t.sqrt()
+                    x0_pred_debug = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z0_pred_debug])
+                    
+                    # [요청 3] Log reconstruction error (Chamfer Distance) instead of grad norm
+                    y_pred_debug = forward_model.forward(x0_pred_debug)
+                    dist1, dist2, _, _ = debug_cd_loss(y_pred_debug, y)
+                    cd_error = torch.mean(dist1) + torch.mean(dist2)
+
+                    logging.info(f"\nDebug [Step {i:04d}/{len(timesteps)}] - Reconstruction Error (CD): {cd_error.item():.4f}")
+                    
+                    # Save intermediate reconstruction
+                    plot_points(x0_pred_debug, f"./tmp/recon_step_{i:04d}.png")
+        
+        output_dict['z_local'] = z_local
+
+        # 4. Final Decoding
+        with torch.no_grad():
+            output = self.vae.sample(num_samples=num_samples, decomposed_eps=[z_global, z_local])
+        output_dict['points'] = output
         return output_dict
 
     def get_mixing_component(self, noise_pred, t):
