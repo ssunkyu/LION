@@ -24,7 +24,6 @@ RUN python -m pip install cmake
 RUN python -m pip install scipy
 #RUN python -m pip install pykeops
 RUN python -m pip install h5py
-RUN python -m pip install wandb
 RUN python -m pip install --ignore-installed PyYAML
 #RUN python -m pip install open3d
 RUN python -m pip install cupy-cuda111
@@ -43,6 +42,10 @@ RUN export DYLD_LIBRARY_PATH=/usr/local/cuda-11.1/lib:$DYLD_LIBRARY_PATH
 
 RUN python -m pip install git+https://github.com/openai/CLIP.git
 RUN python -m pip install loguru einops comet_ml calmsize diffusers
+
+RUN python -m pip install pydantic==1.8.2 'wandb<0.15.0'
+RUN python -m pip install open3d
+RUN python -m pip install "git+https://github.com/erikwijmans/Pointnet2_PyTorch.git#egg=pointnet2_ops&subdirectory=pointnet2_ops_lib"
 
 #COPY environment.yml .
 #COPY activate.sh .

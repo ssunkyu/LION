@@ -1,0 +1,39 @@
+#================================================================
+# Configuration for Inverse Problem Solving using LION
+#================================================================
+
+# --- File and Directory Paths ---
+paths:
+  pcd_data: './data/ShapeNetCore.v2.PC15k'
+  # model: './lion_ckpt/text2shape/chair/checkpoints/model.pt'
+  # model: './lion_ckpt/unconditional/chair/checkpoints/model.pt'
+  model: './lion_ckpt/unconditional/all55/checkpoints/epoch_10999_iters_2100999.pt'
+  # model: './lion_ckpt/unconditional/all55/samples.pt'
+  model_cfg: './config/all_uncond_cfg.yml'
+  log_dir: './log_chang'
+
+# --- Experiment Settings ---
+experiment:
+  category_to_find: 'chair'
+  forward_operator: 'denoise_pcd'
+  prompt: ""
+  
+  loss_functions:
+    - name: 'chamfer'
+      weight: 1.0
+    # - name: 'emd'
+    #   weight: 0.0
+    # - name: 'soft_chamfer'
+      # weight: 1.0
+
+# --- Hyperparameters ---
+hyperparameters:
+  guidance_start_t: 1000 # 0 = deactivate guidance
+  guidance_stop_t: 0
+  guidance_scale: 1
+  consistency_scale: 0.0
+  model_n_points: 2048
+  guidance_scheduler: 'linear+const'
+  soft_chamfer_temp: 1
+
+debug_mode: true

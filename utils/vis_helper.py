@@ -25,6 +25,8 @@ def plot_points(output, output_name=None):
     input_list = []
     for idx in range(output.shape[0]):
         pts = output[idx]
+        # pts = torch.clip(pts, -0.7, 0.7) * 2
+        # input_img = visualize_point_clouds_3d([pts], ['out#%d' % idx])
         pts = normalize_point_clouds([pts])
         input_img = visualize_point_clouds_3d(pts, ['out#%d' % idx])
         input_list.append(input_img)

@@ -1,31 +1,25 @@
-#================================================================
-# Configuration for Inverse Problem Solving using LION
-#================================================================
+conditioning:
+  method: 'ps_lin'
+  params:
+    guidance_start: 0
+    guidance_end: 0.4
+    # guidance_start_t: 0
+    # guidance_end_t: 1000
 
-# --- File and Directory Paths ---
-paths:
-  pcd_data: './data/ShapeNetCore.v2.PC15k'
-  model: './lion_ckpt/text2shape/chair/checkpoints/model.pt'
-  model_cfg: './config/chair_cfg.yml'
-  log_dir: './log'
-
-# --- Experiment Settings ---
-experiment:
+data:
+  name: shapenet15k
+  root: ./data/ShapeNetCore.v2.PC15k
   category_to_find: 'chair'
-  forward_operator: 'denoise_pcd'
-  prompt: ""
-  
-  loss_functions:
-    - name: 'chamfer'
-      weight: 1.0
-    - name: 'emd'
-      weight: 1.0
+  model_n_points: 8192
 
-# --- Hyperparameters ---
-hyperparameters:
-  guidance_scale: 100.0 # 0 = deactivate guidance
-  guidance_start_t: 1000
-  model_n_points: 2048
-  debug_mode: true
-  guidance_scheduler: 'linear'
-  soft_chamfer_temperature: 0.1
+measurement:
+  operator:
+    name: denoise_pcd # denoise, inpainting, super_resolution, blur
+  # kernel_size: 61
+  # intensity: 0.5
+
+  noise:
+    name: song_chamfer
+    sigma: 0.05
+  
+prompt: ""

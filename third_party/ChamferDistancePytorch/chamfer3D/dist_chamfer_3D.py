@@ -150,5 +150,16 @@ class SoftChamferDistance(nn.Module):
         loss2 = torch.mean(soft_dist2)
         
         total_loss = loss1 + loss2
-        
+
         return total_loss
+    
+    def apply(self, xyz1: torch.Tensor, xyz2: torch.Tensor) -> torch.Tensor:
+        dist_matrix = torch.cdist(xyz1, xyz2, p=2)**2
+
+        weights1 = torch.softmax(-dist_matrix / self.temperature, dim=2)
+        soft_dist1 = torch.sum(weights1 * dist_matrix, dim=2)
+
+        weights2 = torch.softmax(-dist_matrix.transpose(1, 2) / self.temperature, dim=2)
+        soft_dist2 = torch.sum(weights2 * dist_matrix.transpose(1, 2), dim=2) # Shape: (B, M)
+
+        return soft_dist1, soft_dist2

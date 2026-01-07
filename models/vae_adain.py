@@ -337,3 +337,10 @@ class Model(nn.Module):
             [self.args.latent_pts.style_dim, 1, 1],
             [self.num_points*(self.latent_dim+self.input_dim),1,1]
             ]
+
+    def get_local_posterior_mean(self, x, style): 
+        if len(style.shape)  == 4:
+            style = style.squeeze(-1).squeeze(-1)
+        z_dist_params = self.encoder([x, style])
+        z_mu = z_dist_params['mu_1d']
+        return z_mu

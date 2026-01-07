@@ -8,13 +8,13 @@ def run_experiments():
     """
     # Define the hyperparameter grid to search
     param_grid = {
-        'guidance_scale': [50.0, 100.0, 150.0],
-        'guidance_start_t': [500, 1000],
+        'guidance_scale': [1.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0],
+        'guidance_start_t': [200, 400, 600, 800, 1000],
         'guidance_scheduler': ['linear', 'constant'],
         'loss_functions': [
             [{'name': 'chamfer', 'weight': 1.0}],
             [{'name': 'emd', 'weight': 1.0}],
-            [{'name': 'chamfer', 'weight': 1.0}, {'name': 'emd', 'weight': 0.5}]
+            [{'name': 'chamfer', 'weight': 0.5}, {'name': 'emd', 'weight': 0.5}]
         ]
     }
 
