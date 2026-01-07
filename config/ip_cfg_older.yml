@@ -1,0 +1,24 @@
+experiment:
+  category_to_find: chair
+  forward_operator: denoise_pcd
+  loss_functions:
+  - name: chamfer
+    weight: 1.0
+  prompt: ''
+
+debug_mode: true
+
+hyperparameters:
+  consistency_scale: 0.0
+  guidance_scale: 1.0
+  guidance_scheduler: constant
+  guidance_start_t: 1000
+  guidance_stop_t: -1
+  model_n_points: 2048
+  soft_chamfer_temp: 1.0
+
+paths:
+  log_dir: ./log_older
+  model: ./lion_ckpt/unconditional/all55/checkpoints/epoch_10999_iters_2100999.pt
+  model_cfg: ./config/all_uncond_cfg.yml
+  pcd_data: ./data/ShapeNetCore.v2.PC15k

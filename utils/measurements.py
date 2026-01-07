@@ -5,10 +5,11 @@ for Point Cloud Data to simulate a measurement y = Ax + n.
 
 from abc import ABC, abstractmethod
 import torch
+from pointnet2_ops import pointnet2_utils
 
-# =================
-# Base Classes & Registration
-# =================
+# ============================
+# Point Cloud Linear Operators
+# ============================
 
 __OPERATOR__ = {}
 
@@ -39,9 +40,6 @@ class LinearOperator(ABC):
         # A^T * x
         pass
 
-# =================
-# Point Cloud Linear Operators
-# =================
 
 @register_operator(name='denoise_pcd')
 class DenoiseOperatorPCD(LinearOperator):
@@ -90,45 +88,51 @@ class SuperResolutionOperatorPCD(LinearOperator):
         self.num_points_out = num_points_out
         self.device = device
 
-    def _farthest_point_sampling(self, pcd, n_samples):
-        B, N, C = pcd.shape
-        centroids = torch.zeros(B, n_samples, dtype=torch.long, device=self.device)
-        distance = torch.ones(B, N, device=self.device) * 1e10
-        farthest = torch.randint(0, N, (B,), dtype=torch.long, device=self.device)
-        batch_indices = torch.arange(B, dtype=torch.long, device=self.device)
+    def _farthest_point_sampling_optimized(self, pcd, n_samples):
+        """
+        Performs Farthest Point Sampling using a highly optimized CUDA kernel.
+
+        Args:
+            pcd (torch.Tensor): The input point cloud with shape (B, N, C).
+            n_samples (int): The number of points to sample.
+
+        Returns:
+            torch.Tensor: The sampled point cloud with shape (B, n_samples, C).
+        """
+        # pointnet2_utils.furthest_point_sample expects (B, N, C) tensor.
+        # It returns the indices of the sampled points.
+        # shape: (B, n_samples)
+        sampled_indices = pointnet2_utils.furthest_point_sample(pcd, n_samples)
         
-        for i in range(n_samples):
-            centroids[:, i] = farthest
-            centroid = pcd[batch_indices, farthest, :].view(B, 1, C)
-            dist = torch.sum((pcd - centroid) ** 2, -1)
-            mask = dist < distance
-            distance[mask] = dist[mask]
-            farthest = torch.max(distance, -1)[1]
-            
-        # Index the points using the FPS result.
-        # Expand centroids for torch.gather to index all coordinates.
-        centroids_expanded = centroids.unsqueeze(-1).expand(B, n_samples, C)
-        return torch.gather(pcd, 1, centroids_expanded)
+        # Use the indices to gather the points from the original point cloud.
+        # This is equivalent to torch.gather but often more intuitive.
+        # sampled_indices must be expanded to match the coordinate dimension (C).
+        # shape: (B, n_samples, C)
+        sampled_pcd = pointnet2_utils.gather_operation(pcd.transpose(1, 2).contiguous(), sampled_indices)
+        
+        return sampled_pcd.transpose(1, 2).contiguous()
 
     def forward(self, data, **kwargs):
-        # Downsample using FPS.
-        return self._farthest_point_sampling(data, self.num_points_out)
+        """ Downsample using the optimized FPS. """
+        # The input point cloud 'data' is expected to be in (B, N, C) format.
+        return self._farthest_point_sampling_optimized(data, self.num_points_out)
 
     def transpose(self, data, **kwargs):
-        # The exact transpose of FPS is complex and ill-defined.
-        # Upsampling is typically learned by the generative model itself.
-        # This function is rarely used in practice.
+        """
+        The exact transpose of FPS is complex and ill-defined.
+        Upsampling is typically learned by the generative model itself.
+        This function is rarely used in practice.
+        """
         print("Warning: Transpose of Farthest Point Sampling is ill-defined. Returning identity.")
         return data
 
 @register_operator(name='blur_pcd')
-class BlurOperatorPCD(LinearOperator):
+class BlurOperatorPCD_Sparse(LinearOperator):
     """
-    Point cloud blurring, approximated as a linear operator.
-    This is achieved by pre-calculating a weight matrix W based on k-NN,
-    linearizing an otherwise non-linear operation.
+    Point cloud blurring, memory-efficiently implemented using a sparse weight matrix.
     """
-    def __init__(self, k, sigma, device):
+    def __init__(self, device, k=20, sigma=0.05):
+        super().__init__(device)
         self.k = k
         self.sigma = sigma
         self.device = device
@@ -138,45 +142,43 @@ class BlurOperatorPCD(LinearOperator):
         B, N, _ = pcd.shape
         dist_matrix = torch.cdist(pcd, pcd, p=2.0)
         
-        # Find the k-nearest neighbors for each point.
-        _, nn_indices = torch.topk(dist_matrix, self.k, dim=-1, largest=False) # (B, N, k)
+        nn_dists, nn_indices = torch.topk(dist_matrix, self.k, dim=-1, largest=False)
 
-        # Calculate Gaussian weights.
-        W = torch.zeros(B, N, N, device=self.device)
-        batch_indices = torch.arange(B, device=self.device).view(B, 1)
-        
-        # Vectorized implementation for building the weight matrix
-        k_indices = nn_indices.view(B, -1) # (B, N*k)
-        row_indices = torch.arange(N, device=self.device).view(1, N, 1).expand(B, N, self.k).reshape(B, -1) # (B, N*k)
-        
-        # Gather distances for all neighbors
-        dists_sq = dist_matrix[batch_indices, row_indices, k_indices].view(B, N, self.k).pow(2)
-        
-        # Calculate and normalize weights
+        dists_sq = nn_dists.pow(2)
         weights = torch.exp(-dists_sq / (2 * self.sigma**2))
         normalized_weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        batch_indices = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, N, self.k)
+        row_indices = torch.arange(N, device=self.device).view(1, N, 1).expand(B, N, self.k)
         
-        # Populate the sparse weight matrix W
-        W[batch_indices, row_indices, k_indices] = normalized_weights.view(B, -1)
-        self.W = W
+        i = torch.stack([batch_indices.flatten(), row_indices.flatten(), nn_indices.flatten()])
+        v = normalized_weights.flatten()
+        
+        self.W = torch.sparse_coo_tensor(i, v, (B, N, N))
 
     def forward(self, data, **kwargs):
-        # The weight matrix is built on the first forward call,
-        # assuming the geometry of the data is fixed for this operator instance.
         if self.W is None:
             self._build_weight_matrix(data)
-        # Linear operation: y = Wx
-        return torch.bmm(self.W, data)
+        
+        # CORRECTED: No transpose needed for the input data.
+        # Shape: (B, N, N) @ (B, N, 3) -> (B, N, 3)
+        return self.W.bmm(data)
 
     def transpose(self, data, **kwargs):
         if self.W is None:
             raise RuntimeError("Weight matrix W is not built. Call forward first.")
-        # Transpose operation: y = W^T x
-        return torch.bmm(self.W.transpose(1, 2), data)
+        
+        # For transpose operation, we use the transpose of the weight matrix.
+        W_T = self.W.transpose(1, 2)
+        
+        # CORRECTED: No transpose needed for the input data.
+        # Shape: (B, N, N) @ (B, N, 3) -> (B, N, 3)
+        return W_T.bmm(data)
 
-# =============
+
+# ==========================
 # Point Cloud Noise classes
-# =============
+# ==========================
 
 __NOISE__ = {}
 
@@ -197,6 +199,7 @@ def get_noise(name: str, **kwargs):
     noiser.__name__ = name
     return noiser
 
+
 class Noise(ABC):
     """Abstract base class for noise models."""
     def __call__(self, data):
@@ -206,15 +209,42 @@ class Noise(ABC):
     def forward(self, data):
         pass
 
-@register_noise(name='clean_pcd')
+@register_noise(name='clean')
 class CleanPCD(Noise):
     """Applies no noise."""
     def forward(self, data):
         return data
 
-@register_noise(name='gaussian_pcd')
+@register_noise(name='gaussian')
 class GaussianNoisePCD(Noise):
     """Adds signal-independent Gaussian noise."""
+    def __init__(self, sigma):
+        self.sigma = sigma
+    
+    def forward(self, data):
+        return data + torch.randn_like(data, device=data.device) * self.sigma
+    
+@register_noise(name='chamfer')
+class ChamferNoisePCD(Noise):
+    """Adds signal-independent Chamfer noise."""
+    def __init__(self, sigma):
+        self.sigma = sigma
+    
+    def forward(self, data):
+        return data + torch.randn_like(data, device=data.device) * self.sigma
+
+@register_noise(name='earth_mover')
+class EarthMoverNoisePCD(Noise):
+    """Adds signal-independent Earth Mover's distance noise."""
+    def __init__(self, sigma):
+        self.sigma = sigma
+    
+    def forward(self, data):
+        return data + torch.randn_like(data, device=data.device) * self.sigma
+
+@register_noise(name='song_chamfer')
+class SongChamferNoisePCD(Noise):
+    """Adds signal-independent song chamfer noise."""
     def __init__(self, sigma):
         self.sigma = sigma
     
